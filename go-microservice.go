@@ -2,9 +2,11 @@ package go_microservice
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"github.com/SleepNFire/go-microservice/gin"
 	"net/http"
+
+	"github.com/sleepnfire/go-microservice/gin"
 )
 
 type ApiService struct {
@@ -40,7 +42,7 @@ func NewMicroService(routers gin.GinService) *MicroService {
 
 func (as *ApiService) startApiService() {
 	fmt.Printf("%s's server is starting on port %s\n", as.name, as.port)
-	if err := as.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	if err := as.server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		fmt.Printf("Fail to start %s's server : %s\n", as.name, err)
 	}
 }
