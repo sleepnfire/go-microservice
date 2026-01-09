@@ -2,10 +2,19 @@ package gin
 
 import (
 	"fmt"
+	"log/slog"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+)
+
+type LogMode int
+
+const (
+	LogModeGin LogMode = iota
+	LogModeSlog
 )
 
 const (
@@ -28,6 +37,54 @@ type GinService struct {
 	Public    ApiGin
 	Internal  ApiGin
 	Technical ApiGin
+}
+
+func NewJSONLogger() *slog.Logger {
+	handler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	})
+	return slog.New(handler)
+}
+
+func GinSlogMiddleware(logger *slog.Logger) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		start := time.Now()
+
+		c.Next()
+
+		latency := time.Since(start)
+
+		serverName, _ := c.Get("server_tag")
+		serverPort, _ := c.Get("server_port")
+
+		logger.Info("http_request",
+			"event", "http_request",
+			"server", serverName,
+			"port", serverPort,
+			"method", c.Request.Method,
+			"path", c.Request.URL.Path,
+			"status", c.Writer.Status(),
+			"latency_ms", latency.Milliseconds(),
+			"client_ip", c.ClientIP(),
+		)
+	}
+}
+
+func GinRecoverySlog(logger *slog.Logger) gin.HandlerFunc {
+	return gin.CustomRecovery(func(c *gin.Context, recovered any) {
+		serverName, _ := c.Get("server_tag")
+		serverPort, _ := c.Get("server_port")
+
+		logger.Error("panic_recovered",
+			"event", "panic",
+			"server", serverName,
+			"port", serverPort,
+			"path", c.Request.URL.Path,
+			"error", recovered,
+		)
+
+		c.AbortWithStatus(500)
+	})
 }
 
 func ServerTag(name string, port string) gin.HandlerFunc {
@@ -80,7 +137,12 @@ func CustomFormatter(param gin.LogFormatterParams) string {
 	return strings.TrimRight(base, "\n") + suffix + "\n"
 }
 
-func NewGinService() GinService {
+func NewGinService(mode LogMode) GinService {
+	var slogger *slog.Logger
+	if mode == LogModeSlog {
+		slogger = NewJSONLogger()
+	}
+
 	gs := GinService{
 		Public: ApiGin{
 			Engine: gin.New(),
@@ -99,18 +161,23 @@ func NewGinService() GinService {
 		},
 	}
 
-	gs.Public.Engine.Use(ServerTag(Public, Port80[1:]))
-	gs.Internal.Engine.Use(ServerTag(Internal, Port81[1:]))
-	gs.Technical.Engine.Use(ServerTag(Technical, Port82[1:]))
+	setup := func(api *ApiGin, name, port string) {
+		api.Engine.Use(ServerTag(name, port))
 
-	gs.Public.Engine.Use(gin.LoggerWithFormatter(CustomFormatter))
-	gs.Public.Engine.Use(gin.Recovery())
+		if mode == LogModeGin {
+			api.Engine.Use(gin.LoggerWithFormatter(CustomFormatter))
+			api.Engine.Use(gin.Recovery())
+		}
 
-	gs.Internal.Engine.Use(gin.LoggerWithFormatter(CustomFormatter))
-	gs.Internal.Engine.Use(gin.Recovery())
+		if mode == LogModeSlog {
+			api.Engine.Use(GinRecoverySlog(slogger))
+			api.Engine.Use(GinSlogMiddleware(slogger))
+		}
+	}
 
-	gs.Technical.Engine.Use(gin.LoggerWithFormatter(CustomFormatter))
-	gs.Technical.Engine.Use(gin.Recovery())
+	setup(&gs.Public, Public, Port80[1:])
+	setup(&gs.Internal, Internal, Port81[1:])
+	setup(&gs.Technical, Technical, Port82[1:])
 
 	return gs
 }
