@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -25,6 +26,16 @@ func TestMain(m *testing.M) {
 func performRequest(engine http.Handler, method, path string) *httptest.ResponseRecorder {
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(method, path, nil)
+	engine.ServeHTTP(w, req)
+	return w
+}
+
+func performRequestWithHeaders(engine http.Handler, method, path string, headers map[string]string) *httptest.ResponseRecorder {
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(method, path, nil)
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
 	engine.ServeHTTP(w, req)
 	return w
 }
@@ -60,16 +71,352 @@ func TestNewGinService_EnginesNotNil(t *testing.T) {
 
 func TestNewGinService_MiddlewareCount_GinMode(t *testing.T) {
 	gs := NewGinService(LogModeGin)
-	assert.Len(t, gs.Public.Engine.Handlers, 3)
-	assert.Len(t, gs.Internal.Engine.Handlers, 3)
-	assert.Len(t, gs.Technical.Engine.Handlers, 3)
+	// Public: ServerTag + RequestID + Logger + Recovery + SecureHeaders
+	assert.Len(t, gs.Public.Engine.Handlers, 5)
+	// Internal/Technical: ServerTag + RequestID + Logger + Recovery
+	assert.Len(t, gs.Internal.Engine.Handlers, 4)
+	assert.Len(t, gs.Technical.Engine.Handlers, 4)
 }
 
 func TestNewGinService_MiddlewareCount_SlogMode(t *testing.T) {
 	gs := NewGinService(LogModeSlog)
-	assert.Len(t, gs.Public.Engine.Handlers, 3)
+	// Public: ServerTag + RequestID + RecoverySlog + SlogMiddleware + SecureHeaders
+	assert.Len(t, gs.Public.Engine.Handlers, 5)
+	// Internal/Technical: ServerTag + RequestID + RecoverySlog + SlogMiddleware
+	assert.Len(t, gs.Internal.Engine.Handlers, 4)
+	assert.Len(t, gs.Technical.Engine.Handlers, 4)
+}
+
+func TestNewGinService_MiddlewareCount_NoopMode(t *testing.T) {
+	gs := NewGinService(LogModeNoop)
+	// Public: ServerTag + RequestID + Recovery + SecureHeaders
+	assert.Len(t, gs.Public.Engine.Handlers, 4)
+	// Internal/Technical: ServerTag + RequestID + Recovery
 	assert.Len(t, gs.Internal.Engine.Handlers, 3)
 	assert.Len(t, gs.Technical.Engine.Handlers, 3)
+}
+
+func TestNewGinService_MiddlewareCount_SecureHeadersDisabled(t *testing.T) {
+	gs := NewGinService(LogModeGin, WithSecureHeaders(false))
+	// No SecureHeaders on Public
+	assert.Len(t, gs.Public.Engine.Handlers, 4)
+}
+
+func TestNewGinService_MiddlewareCount_WithMaxBodySize(t *testing.T) {
+	gs := NewGinService(LogModeGin, WithMaxBodySize(4<<20))
+	// Public: +1 for MaxBodySize on top of GinMode count
+	assert.Len(t, gs.Public.Engine.Handlers, 6)
+	// Internal unchanged
+	assert.Len(t, gs.Internal.Engine.Handlers, 4)
+}
+
+// --- Options ---
+
+func TestWithPublicPort_ChangesPort(t *testing.T) {
+	gs := NewGinService(LogModeNoop, WithPublicPort(":9090"))
+	assert.Equal(t, ":9090", gs.Public.Port)
+	assert.Equal(t, ":8081", gs.Internal.Port)
+	assert.Equal(t, ":8082", gs.Technical.Port)
+}
+
+func TestWithInternalPort_ChangesPort(t *testing.T) {
+	gs := NewGinService(LogModeNoop, WithInternalPort(":9091"))
+	assert.Equal(t, ":8080", gs.Public.Port)
+	assert.Equal(t, ":9091", gs.Internal.Port)
+}
+
+func TestWithTechnicalPort_ChangesPort(t *testing.T) {
+	gs := NewGinService(LogModeNoop, WithTechnicalPort(":9092"))
+	assert.Equal(t, ":9092", gs.Technical.Port)
+}
+
+func TestWithAllPorts_ChangesAllPorts(t *testing.T) {
+	gs := NewGinService(LogModeNoop,
+		WithPublicPort(":9080"),
+		WithInternalPort(":9081"),
+		WithTechnicalPort(":9082"),
+	)
+	assert.Equal(t, ":9080", gs.Public.Port)
+	assert.Equal(t, ":9081", gs.Internal.Port)
+	assert.Equal(t, ":9082", gs.Technical.Port)
+}
+
+// --- SecureHeaders ---
+
+func TestSecureHeaders_AddsAllHeaders(t *testing.T) {
+	engine := gin.New()
+	engine.Use(SecureHeaders())
+	engine.GET("/ping", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	w := performRequest(engine, "GET", "/ping")
+
+	assert.Equal(t, "nosniff", w.Header().Get("X-Content-Type-Options"))
+	assert.Equal(t, "DENY", w.Header().Get("X-Frame-Options"))
+	assert.Equal(t, "0", w.Header().Get("X-XSS-Protection"))
+	assert.Equal(t, "strict-origin-when-cross-origin", w.Header().Get("Referrer-Policy"))
+}
+
+func TestSecureHeaders_PresentOnPublicByDefault(t *testing.T) {
+	gs := NewGinService(LogModeNoop, WithPublicRoutes(func(r gin.IRouter) {
+		r.GET("/ping", func(c *gin.Context) { c.Status(http.StatusOK) })
+	}))
+
+	w := performRequest(gs.Public.Engine, "GET", "/ping")
+	assert.Equal(t, "nosniff", w.Header().Get("X-Content-Type-Options"))
+	assert.Equal(t, "DENY", w.Header().Get("X-Frame-Options"))
+}
+
+func TestSecureHeaders_AbsentWhenDisabled(t *testing.T) {
+	gs := NewGinService(LogModeNoop, WithSecureHeaders(false), WithPublicRoutes(func(r gin.IRouter) {
+		r.GET("/ping", func(c *gin.Context) { c.Status(http.StatusOK) })
+	}))
+
+	w := performRequest(gs.Public.Engine, "GET", "/ping")
+	assert.Empty(t, w.Header().Get("X-Content-Type-Options"))
+}
+
+func TestSecureHeaders_NotOnInternal(t *testing.T) {
+	gs := NewGinService(LogModeNoop, WithInternalRoutes(func(r gin.IRouter) {
+		r.GET("/ping", func(c *gin.Context) { c.Status(http.StatusOK) })
+	}))
+
+	w := performRequest(gs.Internal.Engine, "GET", "/ping")
+	assert.Empty(t, w.Header().Get("X-Content-Type-Options"))
+}
+
+func TestSecureHeaders_NotOnTechnical(t *testing.T) {
+	gs := NewGinService(LogModeNoop)
+	w := performRequest(gs.Technical.Engine, "GET", "/health")
+	assert.Empty(t, w.Header().Get("X-Content-Type-Options"))
+}
+
+// --- MaxBodySize ---
+
+func TestMaxBodySize_AllowsBodyUnderLimit(t *testing.T) {
+	engine := gin.New()
+	engine.Use(MaxBodySize(100))
+
+	var readErr error
+	engine.POST("/upload", func(c *gin.Context) {
+		_, readErr = io.ReadAll(c.Request.Body)
+		c.Status(http.StatusOK)
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/upload", strings.NewReader("hello"))
+	engine.ServeHTTP(w, req)
+
+	assert.NoError(t, readErr)
+	assert.Equal(t, http.StatusOK, w.Code)
+}
+
+func TestMaxBodySize_RejectsBodyOverLimit(t *testing.T) {
+	engine := gin.New()
+	engine.Use(MaxBodySize(5))
+
+	var readErr error
+	engine.POST("/upload", func(c *gin.Context) {
+		_, readErr = io.ReadAll(c.Request.Body)
+		c.Status(http.StatusOK)
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/upload", strings.NewReader("more than five bytes"))
+	engine.ServeHTTP(w, req)
+
+	assert.Error(t, readErr)
+}
+
+func TestWithMaxBodySize_AppliedOnPublicOnly(t *testing.T) {
+	gs := NewGinService(LogModeNoop,
+		WithMaxBodySize(5),
+		WithPublicRoutes(func(r gin.IRouter) {
+			r.POST("/upload", func(c *gin.Context) {
+				_, err := io.ReadAll(c.Request.Body)
+				if err != nil {
+					c.Status(http.StatusRequestEntityTooLarge)
+					return
+				}
+				c.Status(http.StatusOK)
+			})
+		}),
+		WithInternalRoutes(func(r gin.IRouter) {
+			r.POST("/upload", func(c *gin.Context) {
+				io.ReadAll(c.Request.Body)
+				c.Status(http.StatusOK)
+			})
+		}),
+	)
+
+	bigBody := strings.NewReader("more than five bytes")
+
+	// Public rejects oversized body
+	wPub := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/upload", bigBody)
+	gs.Public.Engine.ServeHTTP(wPub, req)
+	assert.Equal(t, http.StatusRequestEntityTooLarge, wPub.Code)
+
+	// Internal has no limit — same body size succeeds
+	bigBody2 := strings.NewReader("more than five bytes")
+	wInt := httptest.NewRecorder()
+	req2 := httptest.NewRequest("POST", "/upload", bigBody2)
+	gs.Internal.Engine.ServeHTTP(wInt, req2)
+	assert.Equal(t, http.StatusOK, wInt.Code)
+}
+
+// --- WithPublicRoutes / WithInternalRoutes / WithTechnicalRoutes ---
+
+func TestWithPublicRoutes_RegistersRoutes(t *testing.T) {
+	gs := NewGinService(LogModeNoop, WithPublicRoutes(func(r gin.IRouter) {
+		r.GET("/hello", func(c *gin.Context) { c.String(http.StatusOK, "world") })
+	}))
+
+	w := performRequest(gs.Public.Engine, "GET", "/hello")
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "world", w.Body.String())
+}
+
+func TestWithPublicRoutes_NotOnOtherServers(t *testing.T) {
+	gs := NewGinService(LogModeNoop, WithPublicRoutes(func(r gin.IRouter) {
+		r.GET("/hello", func(c *gin.Context) { c.Status(http.StatusOK) })
+	}))
+
+	assert.Equal(t, http.StatusNotFound, performRequest(gs.Internal.Engine, "GET", "/hello").Code)
+	assert.Equal(t, http.StatusNotFound, performRequest(gs.Technical.Engine, "GET", "/hello").Code)
+}
+
+func TestWithInternalRoutes_RegistersRoutes(t *testing.T) {
+	gs := NewGinService(LogModeNoop, WithInternalRoutes(func(r gin.IRouter) {
+		r.GET("/stats", func(c *gin.Context) { c.String(http.StatusOK, "ok") })
+	}))
+
+	assert.Equal(t, http.StatusOK, performRequest(gs.Internal.Engine, "GET", "/stats").Code)
+	assert.Equal(t, http.StatusNotFound, performRequest(gs.Public.Engine, "GET", "/stats").Code)
+}
+
+func TestWithTechnicalRoutes_RegistersAdditionalRoutes(t *testing.T) {
+	gs := NewGinService(LogModeNoop, WithTechnicalRoutes(func(r gin.IRouter) {
+		r.GET("/debug/pprof", func(c *gin.Context) { c.Status(http.StatusOK) })
+	}))
+
+	// Built-in routes still work
+	assert.Equal(t, http.StatusOK, performRequest(gs.Technical.Engine, "GET", "/health").Code)
+	// Custom route also works
+	assert.Equal(t, http.StatusOK, performRequest(gs.Technical.Engine, "GET", "/debug/pprof").Code)
+}
+
+func TestWithPublicRoutes_GetsSecureHeaders(t *testing.T) {
+	gs := NewGinService(LogModeNoop, WithPublicRoutes(func(r gin.IRouter) {
+		r.GET("/api", func(c *gin.Context) { c.Status(http.StatusOK) })
+	}))
+
+	w := performRequest(gs.Public.Engine, "GET", "/api")
+	assert.Equal(t, "nosniff", w.Header().Get("X-Content-Type-Options"))
+}
+
+// --- Technical routes ---
+
+func TestTechnicalRoutes_HealthAlwaysReturns200(t *testing.T) {
+	gs := NewGinService(LogModeNoop)
+	w := performRequest(gs.Technical.Engine, "GET", "/health")
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var body map[string]any
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&body))
+	assert.Equal(t, "ok", body["status"])
+}
+
+func TestTechnicalRoutes_ReadyReturns200ByDefault(t *testing.T) {
+	gs := NewGinService(LogModeNoop)
+	w := performRequest(gs.Technical.Engine, "GET", "/ready")
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var body map[string]any
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&body))
+	assert.Equal(t, "ready", body["status"])
+}
+
+func TestTechnicalRoutes_ReadyReturns503WhenCheckFails(t *testing.T) {
+	gs := NewGinService(LogModeNoop, WithReadinessCheck(func() bool { return false }))
+	w := performRequest(gs.Technical.Engine, "GET", "/ready")
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+
+	var body map[string]any
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&body))
+	assert.Equal(t, "not_ready", body["status"])
+}
+
+func TestTechnicalRoutes_ReadyReturns200WhenCheckPasses(t *testing.T) {
+	gs := NewGinService(LogModeNoop, WithReadinessCheck(func() bool { return true }))
+	w := performRequest(gs.Technical.Engine, "GET", "/ready")
+	assert.Equal(t, http.StatusOK, w.Code)
+}
+
+func TestTechnicalRoutes_VersionNotRegisteredWithoutOption(t *testing.T) {
+	gs := NewGinService(LogModeNoop)
+	w := performRequest(gs.Technical.Engine, "GET", "/version")
+	assert.Equal(t, http.StatusNotFound, w.Code)
+}
+
+func TestTechnicalRoutes_VersionReturnsVersionString(t *testing.T) {
+	gs := NewGinService(LogModeNoop, WithVersion("v1.2.3"))
+	w := performRequest(gs.Technical.Engine, "GET", "/version")
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var body map[string]any
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&body))
+	assert.Equal(t, "v1.2.3", body["version"])
+}
+
+func TestTechnicalRoutes_NotRegisteredOnPublic(t *testing.T) {
+	gs := NewGinService(LogModeNoop)
+	assert.Equal(t, http.StatusNotFound, performRequest(gs.Public.Engine, "GET", "/health").Code)
+	assert.Equal(t, http.StatusNotFound, performRequest(gs.Public.Engine, "GET", "/ready").Code)
+}
+
+// --- RequestID ---
+
+func TestRequestID_GeneratesIDWhenAbsent(t *testing.T) {
+	engine := gin.New()
+	engine.Use(RequestID())
+
+	var gotID string
+	engine.GET("/ping", func(c *gin.Context) {
+		gotID = c.GetString("request_id")
+		c.Status(http.StatusOK)
+	})
+
+	w := performRequest(engine, "GET", "/ping")
+	assert.NotEmpty(t, gotID)
+	assert.Equal(t, gotID, w.Header().Get("X-Request-ID"))
+}
+
+func TestRequestID_PropagatesExistingID(t *testing.T) {
+	engine := gin.New()
+	engine.Use(RequestID())
+
+	var gotID string
+	engine.GET("/ping", func(c *gin.Context) {
+		gotID = c.GetString("request_id")
+		c.Status(http.StatusOK)
+	})
+
+	w := performRequestWithHeaders(engine, "GET", "/ping", map[string]string{"X-Request-ID": "my-trace-id"})
+	assert.Equal(t, "my-trace-id", gotID)
+	assert.Equal(t, "my-trace-id", w.Header().Get("X-Request-ID"))
+}
+
+func TestRequestID_IDsAreUnique(t *testing.T) {
+	engine := gin.New()
+	engine.Use(RequestID())
+	engine.GET("/ping", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	ids := make(map[string]struct{})
+	for range 20 {
+		w := performRequest(engine, "GET", "/ping")
+		ids[w.Header().Get("X-Request-ID")] = struct{}{}
+	}
+	assert.Len(t, ids, 20)
 }
 
 // --- ServerTag ---
@@ -111,6 +458,7 @@ func TestGinSlogMiddleware_LogsExpectedFields(t *testing.T) {
 	logger, buf := newTestLogger()
 	engine := gin.New()
 	engine.Use(ServerTag("Public", "8080"))
+	engine.Use(RequestID())
 	engine.Use(GinSlogMiddleware(logger))
 	engine.GET("/ping", func(c *gin.Context) { c.Status(http.StatusOK) })
 
@@ -129,6 +477,39 @@ func TestGinSlogMiddleware_LogsExpectedFields(t *testing.T) {
 	assert.EqualValues(t, http.StatusOK, entry["status"])
 	assert.Contains(t, entry, "latency_ms")
 	assert.Contains(t, entry, "client_ip")
+	assert.Contains(t, entry, "request_id")
+	assert.Contains(t, entry, "query")
+	assert.Contains(t, entry, "bytes")
+	assert.Contains(t, entry, "user_agent")
+}
+
+func TestGinSlogMiddleware_LogsQueryString(t *testing.T) {
+	logger, buf := newTestLogger()
+	engine := gin.New()
+	engine.Use(GinSlogMiddleware(logger))
+	engine.GET("/search", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/search?q=hello&page=2", nil)
+	engine.ServeHTTP(w, req)
+
+	var entry map[string]any
+	require.NoError(t, json.NewDecoder(buf).Decode(&entry))
+	assert.Equal(t, "q=hello&page=2", entry["query"])
+}
+
+func TestGinSlogMiddleware_LogsRequestID(t *testing.T) {
+	logger, buf := newTestLogger()
+	engine := gin.New()
+	engine.Use(RequestID())
+	engine.Use(GinSlogMiddleware(logger))
+	engine.GET("/ping", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	performRequestWithHeaders(engine, "GET", "/ping", map[string]string{"X-Request-ID": "trace-abc"})
+
+	var entry map[string]any
+	require.NoError(t, json.NewDecoder(buf).Decode(&entry))
+	assert.Equal(t, "trace-abc", entry["request_id"])
 }
 
 func TestGinSlogMiddleware_UsesContextTagAndPort(t *testing.T) {

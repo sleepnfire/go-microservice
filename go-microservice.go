@@ -3,10 +3,23 @@ package go_microservice
 import (
 	"context"
 	"errors"
-	"fmt"
+	"log/slog"
 	"net/http"
+	"os"
+	"os/signal"
+	"sync"
+	"syscall"
+	"time"
 
 	"github.com/sleepnfire/go-microservice/gin"
+)
+
+const (
+	defaultReadHeaderTimeout = 5 * time.Second
+	defaultReadTimeout       = 10 * time.Second
+	defaultWriteTimeout      = 30 * time.Second
+	defaultIdleTimeout       = 60 * time.Second
+	defaultShutdownTimeout   = 30 * time.Second
 )
 
 type ApiService struct {
@@ -24,8 +37,12 @@ type MicroService struct {
 func NewApiService(router gin.ApiGin) ApiService {
 	return ApiService{
 		server: http.Server{
-			Addr:    router.Port,
-			Handler: router.Engine,
+			Addr:              router.Port,
+			Handler:           router.Engine,
+			ReadHeaderTimeout: defaultReadHeaderTimeout,
+			ReadTimeout:       defaultReadTimeout,
+			WriteTimeout:      defaultWriteTimeout,
+			IdleTimeout:       defaultIdleTimeout,
 		},
 		name: router.Name,
 		port: router.Port,
@@ -41,9 +58,9 @@ func NewMicroService(routers gin.GinService) *MicroService {
 }
 
 func (as *ApiService) startApiService() {
-	fmt.Printf("%s's server is starting on port %s\n", as.name, as.port)
+	slog.Info("server starting", "server", as.name, "port", as.port)
 	if err := as.server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		fmt.Printf("Fail to start %s's server : %s\n", as.name, err)
+		slog.Error("server failed to start", "server", as.name, "error", err)
 	}
 }
 
@@ -53,16 +70,38 @@ func (ms *MicroService) Start() {
 	go ms.Technical.startApiService()
 }
 
-func (as *ApiService) stopApiService() {
-	fmt.Printf("%s's server shuting down \n", as.name)
-	if err := as.server.Shutdown(context.Background()); err != nil {
-		fmt.Printf("%s's server doesn't stop correctly : %s\n", as.name, err)
+func (as *ApiService) stopApiService(ctx context.Context) error {
+	slog.Info("server shutting down", "server", as.name)
+	if err := as.server.Shutdown(ctx); err != nil {
+		slog.Error("server failed to stop", "server", as.name, "error", err)
+		return err
 	}
+	return nil
 }
 
 func (ms *MicroService) Stop() error {
-	ms.Public.stopApiService()
-	ms.Internal.stopApiService()
-	ms.Technical.stopApiService()
-	return nil
+	ctx, cancel := context.WithTimeout(context.Background(), defaultShutdownTimeout)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	errs := make([]error, 3)
+	services := [3]*ApiService{&ms.Public, &ms.Internal, &ms.Technical}
+
+	for i := range services {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			errs[idx] = services[idx].stopApiService(ctx)
+		}(i)
+	}
+	wg.Wait()
+	return errors.Join(errs...)
+}
+
+// WaitForShutdown blocks until SIGINT or SIGTERM is received, then stops all servers.
+func (ms *MicroService) WaitForShutdown() error {
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+	return ms.Stop()
 }
