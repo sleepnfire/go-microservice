@@ -117,6 +117,8 @@ Each push to `main` runs `go vet`, `go test -race` and `govulncheck`, then creat
 The latest tag always gets a **GitHub Release** whose notes are the matching `CHANGELOG.md` section (or generated notes), so Renovate/Dependabot PRs in consuming projects show the **Action requise** items. Missing releases are created on the next push to `main`; *Actions → CI → Run workflow* does it on demand.
 CodeQL (`security-and-quality`) runs on every push, pull request and weekly.
 
+Repository settings: `main` is protected (required check **Test & Vet**, no force-push, no deletion; the owner can still push directly). Dependabot patch/minor PRs are squash-merged automatically once green; majors stay manual. Dependabot security updates and private vulnerability reporting are enabled.
+
 | First word (case-insensitive) | Version bump        |
 |-------------------------------|---------------------|
 | `fix`                         | Patch — `v1.2.3` → `v1.2.4` |
