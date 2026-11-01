@@ -113,8 +113,9 @@ See [CHANGELOG.md](CHANGELOG.md). Releases that change behaviour list the requir
 
 ## CI / Versioning
 
-Each push to `main` runs `go vet`, `go test -race` and `govulncheck`, then creates a SemVer tag based on the first word of the commit message (bare word, no colon: `feature …`, not `feature: …`).
-Every tag gets a **GitHub Release** whose notes are the matching `CHANGELOG.md` section, so Renovate/Dependabot PRs in consuming projects show the **Action requise** items. For a tag pushed by hand, the release job runs on the tag push; for an existing tag, use *Actions → CI → Run workflow* with the tag name.
+Each push to `main` runs `go vet`, `go test -race` and `govulncheck`, then creates a SemVer tag based on the first word of the commit message (`feature …`, `feature: …` and `fix(scope): …` are all accepted).
+The latest tag always gets a **GitHub Release** whose notes are the matching `CHANGELOG.md` section (or generated notes), so Renovate/Dependabot PRs in consuming projects show the **Action requise** items. Missing releases are created on the next push to `main`; *Actions → CI → Run workflow* does it on demand.
+CodeQL (`security-and-quality`) runs on every push, pull request and weekly.
 
 | First word (case-insensitive) | Version bump        |
 |-------------------------------|---------------------|
