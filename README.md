@@ -2,7 +2,7 @@
 
 A Go library that provides a three-server HTTP microservice skeleton using [Gin](https://github.com/gin-gonic/gin).
 
-It wires up three independent `gin.Engine` instances on fixed ports — **Public** (8080), **Internal** (8081), **Technical** (8082) — each with configurable logging middleware and panic recovery.
+It wires up three independent `gin.Engine` instances — **Public** (8080), **Internal** (8081), **Technical** (8082) — each with request IDs, configurable logging and panic recovery, secure defaults and graceful shutdown.
 
 ## Installation
 
@@ -10,98 +10,110 @@ It wires up three independent `gin.Engine` instances on fixed ports — **Public
 go get github.com/sleepnfire/go-microservice
 ```
 
+Requires Go ≥ 1.27.3.
+
 ## Quick Start
 
 ```go
 package main
 
 import (
-    "os"
-    "os/signal"
-    "syscall"
+    "log"
 
+    "github.com/gin-gonic/gin"
     goms "github.com/sleepnfire/go-microservice"
     mgin "github.com/sleepnfire/go-microservice/gin"
 )
 
+var version = "dev" // go build -ldflags "-X main.version=$(git describe --tags)"
+
 func main() {
-    // Create three Gin engines with structured JSON logging
-    gs := mgin.NewGinService(mgin.LogModeSlog)
+    gs := mgin.NewGinService(mgin.LogModeSlog,
+        mgin.WithVersion(version),
+        mgin.WithReadinessCheck(func() bool { return db.Ping() == nil }),
+        mgin.WithMaxBodySize(1<<20),
+        mgin.WithTrustedProxies("10.0.0.10"),          // your reverse proxy
+        mgin.WithInternalPort("127.0.0.1:8081"),       // bind on loopback only
+        mgin.WithTechnicalPort("127.0.0.1:8082"),
+        mgin.WithPublicRoutes(func(r gin.IRouter) {
+            r.GET("/hello", helloHandler)
+        }),
+    )
 
-    // Register routes on any of the three engines
-    gs.Public.Engine.GET("/health", func(c *gin.Context) {
-        c.JSON(200, gin.H{"status": "ok"})
-    })
-    gs.Internal.Engine.GET("/metrics", metricsHandler)
-    gs.Technical.Engine.GET("/ready", readinessHandler)
-
-    // Start all three servers concurrently
     ms := goms.NewMicroService(gs)
     ms.Start()
 
-    // Block until SIGINT/SIGTERM, then gracefully shut down
-    quit := make(chan os.Signal, 1)
-    signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-    <-quit
-
-    ms.Stop()
+    // Blocks until SIGINT/SIGTERM or a server fails to start, then shuts down.
+    if err := ms.WaitForShutdown(); err != nil {
+        log.Fatal(err)
+    }
 }
 ```
 
-## Server Ports
+Using your own lifecycle (uber/fx, errgroup…)? Call `ms.Start()` / `ms.Stop()` yourself and
+select on `ms.Errors()` to detect a server that failed to bind.
 
-| Server    | Default Port | Typical Use                        |
-|-----------|--------------|------------------------------------|
-| Public    | `:8080`      | External-facing API                |
-| Internal  | `:8081`      | Internal service-to-service routes |
-| Technical | `:8082`      | Health checks, metrics, readiness  |
+## Servers
+
+| Server    | Default address | Typical use                        | Built-in routes |
+|-----------|-----------------|------------------------------------|-----------------|
+| Public    | `:8080`         | External-facing API / web app      | — |
+| Internal  | `:8081`         | Internal service-to-service routes | — |
+| Technical | `:8082`         | Health checks, metrics, readiness  | `GET/HEAD /health`, `/ready`, `/version` |
+
+The `With*Port` options take a full listen address: `":8081"` listens on all interfaces,
+`"127.0.0.1:8081"` on loopback only (recommended for Internal/Technical when nothing remote needs them).
+
+- `/health` — liveness, always `200 {"status":"ok"}`.
+- `/ready` — `503` when the readiness check fails **or once `Stop()` has started**, so load balancers drain traffic first.
+- `/version` — only when `WithVersion` is set.
+
+All technical responses carry `Cache-Control: no-store`.
+
+## Options
+
+| Option | Effect |
+|---|---|
+| `WithPublicPort` / `WithInternalPort` / `WithTechnicalPort(addr)` | Listen address of each server |
+| `WithReadinessCheck(func() bool)` | Backs `GET /ready` |
+| `WithVersion(v)` | Exposes `GET /version` |
+| `WithTrustedProxies(cidrs...)` | Proxies allowed to set `X-Forwarded-For` (all servers). **Default: none** |
+| `WithSecureHeaders(bool)` | Security headers on Public (default `true`) |
+| `WithHSTS(maxAge)` | Adds `Strict-Transport-Security` on Public (default off — HTTPS-only deployments) |
+| `WithMaxBodySize(bytes)` | Body limit on Public, `413` when exceeded (default: none) |
+| `WithPublicRoutes` / `WithInternalRoutes` / `WithTechnicalRoutes(fn)` | Register routes at construction |
 
 ## Log Modes
 
-Pass a `LogMode` constant to `NewGinService`:
+| Constant       | Behaviour |
+|----------------|-----------|
+| `LogModeGin`   | Gin's built-in logger with a custom formatter that appends the server name and port. |
+| `LogModeSlog`  | JSON logging via `log/slog`: `event`, `request_id`, `server`, `port`, `method`, `path`, `query`, `status`, `latency_ms`, `bytes`, `client_ip`, `user_agent`. Sensitive query values (`code`, `state`, `token`, `access_token`, `password`, `api_key`…) are logged as `REDACTED`. Panics are logged at `ERROR` with the `request_id`. |
+| `LogModeNoop`  | Recovery only, no request logging (tests). |
 
-| Constant       | Behaviour                                                                                      |
-|----------------|-----------------------------------------------------------------------------------------------|
-| `LogModeGin`   | Gin's built-in logger with a custom formatter that appends the server name and port to each line. |
-| `LogModeSlog`  | Structured JSON logging via `log/slog`. Each request emits a JSON object with fields: `event`, `server`, `port`, `method`, `path`, `status`, `latency_ms`, `client_ip`. Panics are logged at `ERROR` level. |
+## Security & HTTP compliance defaults
 
-## API Reference
+- **Client IP**: no proxy is trusted by default, so `c.ClientIP()` returns the TCP peer and cannot be spoofed via `X-Forwarded-For`. Behind a reverse proxy, declare it with `WithTrustedProxies`.
+- **Request ID**: `X-Request-ID` is propagated only if ≤ 128 chars of `[A-Za-z0-9._-]`; otherwise a UUID v4 (RFC 9562) is generated.
+- **Public security headers**: `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Content-Security-Policy: frame-ancestors 'none'`, `Referrer-Policy: strict-origin-when-cross-origin`, `Cross-Origin-Opener-Policy` / `Cross-Origin-Resource-Policy: same-origin`, `X-XSS-Protection: 0` (OWASP recommendation).
+- **RFC 9110**: unsupported methods on a known path return `405` with an `Allow` header; technical routes answer `HEAD`; oversized bodies return `413`.
+- **Server timeouts**: ReadHeader 5s, Read 10s, Write 30s, Idle 60s, shutdown 30s.
 
-### `gin` package (`github.com/sleepnfire/go-microservice/gin`)
+## Changelog
 
-```go
-func NewGinService(mode LogMode) GinService
-```
+See [CHANGELOG.md](CHANGELOG.md). Releases that change behaviour list the required actions under **Action requise**.
 
-Returns a `GinService` with three pre-wired fields:
+## Migrating from v1.3 (to v1.4.1 — v1.4.0 is retracted)
 
-```go
-type GinService struct {
-    Public    ApiGin
-    Internal  ApiGin
-    Technical ApiGin
-}
-
-type ApiGin struct {
-    Engine *gin.Engine
-    Name   string
-    Port   string
-}
-```
-
-### Root package (`github.com/sleepnfire/go-microservice`)
-
-```go
-func NewMicroService(routers gin.GinService) *MicroService
-func (ms *MicroService) Start()
-func (ms *MicroService) Stop()
-```
-
-`Start()` launches the three servers in goroutines. `Stop()` calls `http.Server.Shutdown` on each sequentially.
+- `ClientIP()` no longer trusts `X-Forwarded-For` by default → add `WithTrustedProxies(<proxy IPs>)` if you run behind HAProxy/nginx.
+- Invalid incoming `X-Request-ID` values are replaced.
+- Unknown methods on existing paths return `405` instead of `404`.
+- `MaxBodySize` rejects requests whose `Content-Length` exceeds the limit with `413` before the handler runs.
+- `/ready` returns `503` as soon as `Stop()` is called.
 
 ## CI / Versioning
 
-Each push to `main` runs tests and creates a SemVer tag automatically based on the first word of the commit message:
+Each push to `main` runs `go vet`, `go test -race` and `govulncheck`, then creates a SemVer tag based on the first word of the commit message:
 
 | First word (case-insensitive) | Version bump        |
 |-------------------------------|---------------------|

@@ -3,6 +3,7 @@ package go_microservice
 import (
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"syscall"
 	"testing"
@@ -218,4 +219,74 @@ func TestWaitForShutdown_StopsOnSIGINT(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("WaitForShutdown did not return after SIGINT")
 	}
+}
+
+// --- Startup failure / readiness on stop / bind address ---
+
+func TestStart_PortInUseReportedOnErrors(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:19095")
+	require.NoError(t, err)
+	defer ln.Close()
+
+	ms := newTestMicroService("127.0.0.1:19095", ":19096", ":19097")
+	ms.Start()
+	t.Cleanup(func() { ms.Stop() })
+
+	select {
+	case err := <-ms.Errors():
+		assert.Contains(t, err.Error(), "Public")
+	case <-time.After(3 * time.Second):
+		t.Fatal("expected a startup error on Errors()")
+	}
+}
+
+func TestWaitForShutdown_ReturnsOnStartupFailure(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:19098")
+	require.NoError(t, err)
+	defer ln.Close()
+
+	ms := newTestMicroService(":19099", "127.0.0.1:19098", ":19100")
+	ms.Start()
+
+	done := make(chan error, 1)
+	go func() { done <- ms.WaitForShutdown() }()
+
+	select {
+	case err := <-done:
+		assert.Error(t, err)
+		assert.True(t, portClosed("127.0.0.1:19099", 2*time.Second))
+	case <-time.After(5 * time.Second):
+		t.Fatal("WaitForShutdown did not return after startup failure")
+	}
+}
+
+func TestStop_MarksNotReady(t *testing.T) {
+	gs := mgin.NewGinService(mgin.LogModeNoop)
+	ms := NewMicroService(gs)
+	require.NoError(t, ms.Stop()) // servers never started: Shutdown is a no-op
+
+	w := httptest.NewRecorder()
+	gs.Technical.Engine.ServeHTTP(w, httptest.NewRequest("GET", "/ready", nil))
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+}
+
+func TestBindAddress_LoopbackOnly(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ms := newTestMicroService("127.0.0.1:19101", "127.0.0.1:19102", "127.0.0.1:19103")
+	ms.Start()
+	t.Cleanup(func() { ms.Stop() })
+
+	assert.True(t, waitForPort(t, "127.0.0.1:19103", 2*time.Second))
+	assert.Equal(t, "127.0.0.1:19103", ms.Technical.server.Addr)
 }

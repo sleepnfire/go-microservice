@@ -3,6 +3,7 @@ package go_microservice
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -32,6 +33,9 @@ type MicroService struct {
 	Public    ApiService
 	Internal  ApiService
 	Technical ApiService
+
+	routers gin.GinService
+	errs    chan error
 }
 
 func NewApiService(router gin.ApiGin) ApiService {
@@ -54,20 +58,33 @@ func NewMicroService(routers gin.GinService) *MicroService {
 		Public:    NewApiService(routers.Public),
 		Internal:  NewApiService(routers.Internal),
 		Technical: NewApiService(routers.Technical),
+		routers:   routers,
+		errs:      make(chan error, 3),
 	}
 }
 
-func (as *ApiService) startApiService() {
+func (as *ApiService) startApiService(errs chan<- error) {
 	slog.Info("server starting", "server", as.name, "port", as.port)
 	if err := as.server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		slog.Error("server failed to start", "server", as.name, "error", err)
+		if errs != nil {
+			errs <- fmt.Errorf("%s server (%s): %w", as.name, as.port, err)
+		}
 	}
 }
 
+// Start launches the three servers in background goroutines. Failures to
+// listen (e.g. port already in use) are reported on Errors().
 func (ms *MicroService) Start() {
-	go ms.Public.startApiService()
-	go ms.Internal.startApiService()
-	go ms.Technical.startApiService()
+	go ms.Public.startApiService(ms.errs)
+	go ms.Internal.startApiService(ms.errs)
+	go ms.Technical.startApiService(ms.errs)
+}
+
+// Errors returns a channel receiving fatal server errors (e.g. bind failure).
+// Consumers using their own lifecycle (fx, errgroup…) should select on it.
+func (ms *MicroService) Errors() <-chan error {
+	return ms.errs
 }
 
 func (as *ApiService) stopApiService(ctx context.Context) error {
@@ -79,7 +96,11 @@ func (as *ApiService) stopApiService(ctx context.Context) error {
 	return nil
 }
 
+// Stop marks the service as not ready (GET /ready → 503) then gracefully
+// shuts down the three servers concurrently.
 func (ms *MicroService) Stop() error {
+	ms.routers.SetShuttingDown()
+
 	ctx, cancel := context.WithTimeout(context.Background(), defaultShutdownTimeout)
 	defer cancel()
 
@@ -98,10 +119,18 @@ func (ms *MicroService) Stop() error {
 	return errors.Join(errs...)
 }
 
-// WaitForShutdown blocks until SIGINT or SIGTERM is received, then stops all servers.
+// WaitForShutdown blocks until SIGINT or SIGTERM is received, or until a
+// server fails to start, then stops all servers. A startup failure is
+// returned joined with any shutdown error.
 func (ms *MicroService) WaitForShutdown() error {
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
-	return ms.Stop()
+	defer signal.Stop(quit)
+
+	var startErr error
+	select {
+	case <-quit:
+	case startErr = <-ms.errs:
+	}
+	return errors.Join(startErr, ms.Stop())
 }

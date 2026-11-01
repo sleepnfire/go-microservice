@@ -224,6 +224,26 @@ func TestMaxBodySize_RejectsBodyOverLimit(t *testing.T) {
 	req := httptest.NewRequest("POST", "/upload", strings.NewReader("more than five bytes"))
 	engine.ServeHTTP(w, req)
 
+	// Content-Length known and too large: rejected before the handler runs.
+	assert.Equal(t, http.StatusRequestEntityTooLarge, w.Code)
+	assert.NoError(t, readErr)
+}
+
+func TestMaxBodySize_ChunkedBodyOverLimitFailsOnRead(t *testing.T) {
+	engine := gin.New()
+	engine.Use(MaxBodySize(5))
+
+	var readErr error
+	engine.POST("/upload", func(c *gin.Context) {
+		_, readErr = io.ReadAll(c.Request.Body)
+		c.Status(http.StatusOK)
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/upload", strings.NewReader("more than five bytes"))
+	req.ContentLength = -1 // unknown length, as with chunked transfer encoding
+	engine.ServeHTTP(w, req)
+
 	assert.Error(t, readErr)
 }
 
@@ -659,4 +679,196 @@ func TestCustomFormatter_Integration_ViaEngine(t *testing.T) {
 
 	assert.Contains(t, buf.String(), "| Public")
 	assert.Contains(t, buf.String(), "8080 |")
+}
+
+// --- Trusted proxies ---
+
+func clientIPEngine(opts ...Option) (*gin.Engine, *string) {
+	var got string
+	opts = append(opts, WithPublicRoutes(func(r gin.IRouter) {
+		r.GET("/ip", func(c *gin.Context) {
+			got = c.ClientIP()
+			c.Status(http.StatusOK)
+		})
+	}))
+	return NewGinService(LogModeNoop, opts...).Public.Engine, &got
+}
+
+func TestTrustedProxies_XFFIgnoredByDefault(t *testing.T) {
+	engine, got := clientIPEngine()
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/ip", nil)
+	req.RemoteAddr = "10.0.0.5:4242"
+	req.Header.Set("X-Forwarded-For", "1.2.3.4")
+	engine.ServeHTTP(w, req)
+
+	assert.Equal(t, "10.0.0.5", *got)
+}
+
+func TestTrustedProxies_XFFHonouredFromDeclaredProxy(t *testing.T) {
+	engine, got := clientIPEngine(WithTrustedProxies("10.0.0.0/8"))
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/ip", nil)
+	req.RemoteAddr = "10.0.0.5:4242"
+	req.Header.Set("X-Forwarded-For", "1.2.3.4")
+	engine.ServeHTTP(w, req)
+
+	assert.Equal(t, "1.2.3.4", *got)
+}
+
+func TestTrustedProxies_XFFIgnoredFromUndeclaredPeer(t *testing.T) {
+	engine, got := clientIPEngine(WithTrustedProxies("10.0.0.0/8"))
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/ip", nil)
+	req.RemoteAddr = "192.168.1.9:4242"
+	req.Header.Set("X-Forwarded-For", "1.2.3.4")
+	engine.ServeHTTP(w, req)
+
+	assert.Equal(t, "192.168.1.9", *got)
+}
+
+func TestTrustedProxies_InvalidCIDRPanics(t *testing.T) {
+	assert.Panics(t, func() { NewGinService(LogModeNoop, WithTrustedProxies("not-an-ip")) })
+}
+
+// --- RequestID validation / UUID v4 ---
+
+func TestRequestID_InvalidIncomingIDIsReplaced(t *testing.T) {
+	engine := gin.New()
+	engine.Use(RequestID())
+	engine.GET("/ping", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	for _, bad := range []string{
+		"bad id with spaces",
+		"inject\"quote",
+		"semi;colon",
+		strings.Repeat("a", 129),
+	} {
+		w := performRequestWithHeaders(engine, "GET", "/ping", map[string]string{"X-Request-ID": bad})
+		got := w.Header().Get("X-Request-ID")
+		assert.NotEqual(t, bad, got)
+		assert.Regexp(t, uuidV4, got)
+	}
+}
+
+func TestRequestID_MaxLengthAccepted(t *testing.T) {
+	engine := gin.New()
+	engine.Use(RequestID())
+	engine.GET("/ping", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	id := strings.Repeat("a", 128)
+	w := performRequestWithHeaders(engine, "GET", "/ping", map[string]string{"X-Request-ID": id})
+	assert.Equal(t, id, w.Header().Get("X-Request-ID"))
+}
+
+const uuidV4 = `^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`
+
+func TestGenerateRequestID_IsUUIDv4(t *testing.T) {
+	for range 50 {
+		assert.Regexp(t, uuidV4, generateRequestID())
+	}
+}
+
+// --- Secure headers additions / HSTS ---
+
+func TestSecureHeaders_ModernHeaders(t *testing.T) {
+	engine := gin.New()
+	engine.Use(SecureHeaders())
+	engine.GET("/ping", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	w := performRequest(engine, "GET", "/ping")
+	assert.Equal(t, "frame-ancestors 'none'", w.Header().Get("Content-Security-Policy"))
+	assert.Equal(t, "same-origin", w.Header().Get("Cross-Origin-Opener-Policy"))
+	assert.Equal(t, "same-origin", w.Header().Get("Cross-Origin-Resource-Policy"))
+	assert.Empty(t, w.Header().Get("Strict-Transport-Security"))
+}
+
+func TestWithHSTS_AddsHeaderOnPublic(t *testing.T) {
+	gs := NewGinService(LogModeNoop, WithHSTS(365*24*time.Hour), WithPublicRoutes(func(r gin.IRouter) {
+		r.GET("/ping", func(c *gin.Context) { c.Status(http.StatusOK) })
+	}))
+
+	w := performRequest(gs.Public.Engine, "GET", "/ping")
+	assert.Equal(t, "max-age=31536000; includeSubDomains", w.Header().Get("Strict-Transport-Security"))
+}
+
+// --- RFC 9110: HEAD, 405, Cache-Control ---
+
+func TestTechnicalRoutes_HeadSupported(t *testing.T) {
+	gs := NewGinService(LogModeNoop, WithVersion("v1"))
+	for _, path := range []string{"/health", "/ready", "/version"} {
+		w := performRequest(gs.Technical.Engine, "HEAD", path)
+		assert.Equal(t, http.StatusOK, w.Code, path)
+	}
+}
+
+func TestTechnicalRoutes_NoStore(t *testing.T) {
+	gs := NewGinService(LogModeNoop)
+	w := performRequest(gs.Technical.Engine, "GET", "/health")
+	assert.Equal(t, "no-store", w.Header().Get("Cache-Control"))
+}
+
+func TestMethodNotAllowed_Returns405WithAllow(t *testing.T) {
+	gs := NewGinService(LogModeNoop)
+	w := performRequest(gs.Technical.Engine, "POST", "/health")
+	assert.Equal(t, http.StatusMethodNotAllowed, w.Code)
+	allow := w.Header().Get("Allow")
+	assert.Contains(t, allow, "GET")
+	assert.Contains(t, allow, "HEAD")
+}
+
+// --- Readiness during shutdown ---
+
+func TestReady_Returns503AfterSetShuttingDown(t *testing.T) {
+	gs := NewGinService(LogModeNoop)
+	assert.Equal(t, http.StatusOK, performRequest(gs.Technical.Engine, "GET", "/ready").Code)
+
+	gs.SetShuttingDown()
+	assert.Equal(t, http.StatusServiceUnavailable, performRequest(gs.Technical.Engine, "GET", "/ready").Code)
+	// liveness is unaffected
+	assert.Equal(t, http.StatusOK, performRequest(gs.Technical.Engine, "GET", "/health").Code)
+}
+
+func TestSetShuttingDown_ZeroValueSafe(t *testing.T) {
+	assert.NotPanics(t, func() { GinService{}.SetShuttingDown() })
+}
+
+// --- Query redaction ---
+
+func TestRedactQuery(t *testing.T) {
+	assert.Equal(t, "", redactQuery(""))
+	assert.Equal(t, "q=hello&page=2", redactQuery("q=hello&page=2"))
+
+	out := redactQuery("code=abc123&state=xyz&q=ok&Access_Token=t0k")
+	assert.NotContains(t, out, "abc123")
+	assert.NotContains(t, out, "xyz")
+	assert.NotContains(t, out, "t0k")
+	assert.Contains(t, out, "q=ok")
+	assert.Contains(t, out, "code=REDACTED")
+}
+
+func TestGinSlogMiddleware_RedactsSensitiveQuery(t *testing.T) {
+	logger, buf := newTestLogger()
+	engine := gin.New()
+	engine.Use(GinSlogMiddleware(logger))
+	engine.GET("/cb", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, httptest.NewRequest("GET", "/cb?code=secretcode&x=1", nil))
+
+	assert.NotContains(t, buf.String(), "secretcode")
+}
+
+func TestGinRecoverySlog_LogsRequestID(t *testing.T) {
+	logger, buf := newTestLogger()
+	engine := gin.New()
+	engine.Use(RequestID())
+	engine.Use(GinRecoverySlog(logger))
+	engine.GET("/boom", func(c *gin.Context) { panic("x") })
+
+	performRequestWithHeaders(engine, "GET", "/boom", map[string]string{"X-Request-ID": "trace-panic"})
+
+	var entry map[string]any
+	require.NoError(t, json.NewDecoder(buf).Decode(&entry))
+	assert.Equal(t, "trace-panic", entry["request_id"])
 }
